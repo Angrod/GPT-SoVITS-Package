@@ -1,3 +1,6 @@
+# Angrod's NOTE
+10/2026 - Ported v2Pro / v2ProPlus inference from RVC-Boss/GPT-SoVITS (June 2025). v2Pro models also need `sv/pretrained_eres2netv2w24s4ep4.ckpt` (and `v2Pro/s2Gv2Pro*.pth` for the base models) from https://huggingface.co/lj1995/GPT-SoVITS in the pretrained models folder; the automatic download fetches them. Checks: `python tests/test_v2pro.py`
+
 # Jarod's NOTE
 4/25/2025 - Synced with original repo to include v3/v4 code and reimplemnted the zeroes-crossing algorithm to run inference in batches
 

@@ -30,6 +30,7 @@ from GPT_SoVITS.module.mel_processing import mel_spectrogram_torch, spectrogram_
 from GPT_SoVITS.module.models import SynthesizerTrn, SynthesizerTrnV3, Generator
 from peft import LoraConfig, get_peft_model
 from GPT_SoVITS.process_ckpt import get_sovits_version_from_path_fast, load_sovits_new
+from GPT_SoVITS.sv import SV, SV_MODEL_RELATIVE_PATH
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 from huggingface_hub import snapshot_download
 
@@ -112,7 +113,7 @@ resample_transform_dict = {}
 
 def resample(audio_tensor, sr0, sr1, device):
     global resample_transform_dict
-    key="%s-%s"%(sr0,sr1)
+    key = "%s-%s-%s" % (sr0, sr1, str(device))
     if key not in resample_transform_dict:
         resample_transform_dict[key] = torchaudio.transforms.Resample(sr0, sr1).to(device)
     return resample_transform_dict[key](audio_tensor)
@@ -256,8 +257,26 @@ class TTS_Config:
             "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/chinese-hubert-base",
             "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
         },
-
+        "v2Pro": {
+            "device": "cpu",
+            "is_half": False,
+            "version": "v2Pro",
+            "t2s_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+            "vits_weights_path": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth",
+            "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/chinese-hubert-base",
+            "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
+        },
+        "v2ProPlus": {
+            "device": "cpu",
+            "is_half": False,
+            "version": "v2ProPlus",
+            "t2s_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+            "vits_weights_path": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth",
+            "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/chinese-hubert-base",
+            "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
+        },
     }
+    supported_versions = {"v1": "v1", "v2": "v2", "v3": "v3", "v4": "v4", "v2pro": "v2Pro", "v2proplus": "v2ProPlus"}
     configs: dict = None
     v1_languages: list = ["auto", "en", "zh", "ja", "all_zh", "all_ja"]
     v2_languages: list = ["auto", "auto_yue", "en", "zh", "ja", "yue", "ko", "all_zh", "all_ja", "all_yue", "all_ko"]
@@ -291,8 +310,8 @@ class TTS_Config:
             configs: dict = self._load_configs(self.configs_path)
 
         assert isinstance(configs, dict)
-        version = configs.get("version", "v2").lower()
-        assert version in ["v1", "v2", "v3", "v4"]
+        version = self.supported_versions.get(str(configs.get("version", "v2")).lower())
+        assert version is not None, f"Unsupported version {configs.get('version')}, expected one of {list(self.supported_versions.values())}"
         self.default_configs[version] = configs.get(version, self.default_configs[version])
         self.configs: dict = configs.get("custom", deepcopy(self.default_configs[version]))
 
@@ -410,6 +429,8 @@ class TTS:
         self.cnhuhbert_model: CNHubert = None
         self.vocoder = None
         self.sr_model: AP_BWE = None
+        self.sv_model: SV = None
+        self.is_v2pro: bool = False
         self.sr_model_not_exist: bool = False
 
         self.vocoder_configs: dict = {
@@ -430,6 +451,7 @@ class TTS:
             "ref_audio_path": None,
             "prompt_semantic": None,
             "refer_spec": [],
+            "refer_sv_audio": [],  # 16 kHz reference audio for the v2Pro speaker embedding, parallel to refer_spec
             "prompt_text": None,
             "prompt_lang": None,
             "phones": None,
@@ -495,6 +517,11 @@ class TTS:
         else:
             hps["model"]["version"] = "v2"
         # version = hps["model"]["version"]
+        self.is_v2pro = model_version in {"v2Pro", "v2ProPlus"}
+        if self.is_v2pro:
+            # v2Pro models use v2 text symbols but need the extra speaker-embedding layers
+            hps["model"]["version"] = model_version
+            self.init_sv_model()
 
         self.configs.filter_length = hps["data"]["filter_length"]
         self.configs.segment_size = hps["train"]["segment_size"]
@@ -562,6 +589,23 @@ class TTS:
         self.vits_model = vits_model
         if self.configs.is_half and str(self.configs.device) != "cpu":
             self.vits_model = self.vits_model.half()
+
+    def init_sv_model(self):
+        if self.sv_model is not None:
+            return
+        # Lives in the same folder that snapshot_download fills from huggingface.co/lj1995/GPT-SoVITS
+        pretrained_dir = os.path.dirname(self.configs.bert_base_path)
+        sv_path = os.path.join(pretrained_dir, SV_MODEL_RELATIVE_PATH)
+        print(f"Loading speaker verification model from {sv_path}")
+        is_half = self.configs.is_half and str(self.configs.device) != "cpu"
+        self.sv_model = SV(self.configs.device, is_half, sv_path)
+
+    def _get_sv_embeddings(self):
+        """Speaker embeddings for the main and auxiliary reference audio (v2Pro/v2ProPlus only)."""
+        if not self.is_v2pro:
+            return None
+        dtype = self.vits_model.sv_emb.weight.dtype
+        return [self.sv_model.compute_embedding3(audio).to(dtype) for audio in self.prompt_cache["refer_sv_audio"]]
 
     def init_t2s_weights(self, weights_path: str):
         print(f"Loading Text2Semantic weights from {weights_path}")
@@ -735,13 +779,32 @@ class TTS:
         self.prompt_cache["ref_audio_path"] = ref_audio_path
 
     def _set_ref_spec(self, ref_audio_path):
-        spec = self._get_ref_spec(ref_audio_path)
+        spec, sv_audio = self._get_ref_spec_and_sv_audio(ref_audio_path)
         if self.prompt_cache["refer_spec"] in [[], None]:
             self.prompt_cache["refer_spec"] = [spec]
         else:
             self.prompt_cache["refer_spec"][0] = spec
+        self.prompt_cache["refer_sv_audio"][:1] = [sv_audio]
+
+    def _set_aux_ref_audio(self, aux_ref_audio_paths):
+        """Keeps the main reference and replaces the auxiliary ones."""
+        self.prompt_cache["aux_ref_audio_paths"] = aux_ref_audio_paths
+        self.prompt_cache["refer_spec"] = [self.prompt_cache["refer_spec"][0]]
+        self.prompt_cache["refer_sv_audio"] = self.prompt_cache["refer_sv_audio"][:1]
+        for path in aux_ref_audio_paths:
+            if path in [None, ""]:
+                continue
+            if not os.path.exists(path):
+                print(i18n("音频文件不存在，跳过："), path)
+                continue
+            spec, sv_audio = self._get_ref_spec_and_sv_audio(path)
+            self.prompt_cache["refer_spec"].append(spec)
+            self.prompt_cache["refer_sv_audio"].append(sv_audio)
 
     def _get_ref_spec(self, ref_audio_path):
+        return self._get_ref_spec_and_sv_audio(ref_audio_path)[0]
+
+    def _get_ref_spec_and_sv_audio(self, ref_audio_path):
         raw_audio, raw_sr = torchaudio.load(ref_audio_path)
         raw_audio = raw_audio.to(self.configs.device).float()
         self.prompt_cache["raw_audio"] = raw_audio
@@ -765,7 +828,9 @@ class TTS:
         spec = spec.to(self.configs.device)
         if self.configs.is_half:
             spec = spec.half()
-        return spec
+        # Always computed (it is cheap) so the cache stays valid if a v2Pro model is loaded later
+        sv_audio = resample(audio_norm.to(self.configs.device), int(self.configs.sampling_rate), 16000, self.configs.device)
+        return spec, sv_audio
 
     def _set_prompt_semantic(self, ref_wav_path: str):
         zero_wav = np.zeros(
@@ -1070,15 +1135,8 @@ class TTS:
         aux_ref_audio_paths = aux_ref_audio_paths if aux_ref_audio_paths is not None else []
         paths = set(aux_ref_audio_paths) & set(self.prompt_cache["aux_ref_audio_paths"])
         if not (len(list(paths)) == len(aux_ref_audio_paths) == len(self.prompt_cache["aux_ref_audio_paths"])):
-            self.prompt_cache["aux_ref_audio_paths"] = aux_ref_audio_paths
-            self.prompt_cache["refer_spec"] = [self.prompt_cache["refer_spec"][0]]
-            for path in aux_ref_audio_paths:
-                if path in [None, ""]:
-                    continue
-                if not os.path.exists(path):
-                    print(i18n("音频文件不存在，跳过："), path)
-                    continue
-                self.prompt_cache["refer_spec"].append(self._get_ref_spec(path))
+            self._set_aux_ref_audio(aux_ref_audio_paths)
+        sv_emb = self._get_sv_embeddings()
 
         if not no_prompt_text:
             prompt_text = prompt_text.strip("\n")
@@ -1236,7 +1294,7 @@ class TTS:
                         )
                         _batch_phones = torch.cat(batch_phones).unsqueeze(0).to(self.configs.device)
                         _batch_audio_fragment = self.vits_model.decode(
-                            all_pred_semantic, _batch_phones, refer_audio_spec, speed=speed_factor
+                            all_pred_semantic, _batch_phones, refer_audio_spec, speed=speed_factor, sv_emb=sv_emb
                         ).detach()[0, 0, :]
                         audio_frag_end_idx.insert(0, 0)
                         batch_audio_fragment = [
@@ -1251,7 +1309,7 @@ class TTS:
                                 pred_semantic_list[i][-idx:].unsqueeze(0).unsqueeze(0)
                             )  # .unsqueeze(0)#mq要多unsqueeze一次
                             audio_fragment = self.vits_model.decode(
-                                _pred_semantic, phones, refer_audio_spec, speed=speed_factor
+                                _pred_semantic, phones, refer_audio_spec, speed=speed_factor, sv_emb=sv_emb
                             ).detach()[0, 0, :]
                             batch_audio_fragment.append(audio_fragment)  ###试试重建不带上prompt部分
                 else:
@@ -1633,11 +1691,8 @@ class TTS:
                 raise ValueError(f"{ref_audio_path} not exists")
             self.set_ref_audio(ref_audio_path)
         # Auxiliary refs
-        self.prompt_cache["aux_ref_audio_paths"] = aux_ref_audio_paths or []
-        self.prompt_cache["refer_spec"] = [self.prompt_cache["refer_spec"][0]]
-        for p in aux_ref_audio_paths or []:
-            if p and os.path.exists(p):
-                self.prompt_cache["refer_spec"].append(self._get_ref_spec(p))
+        self._set_aux_ref_audio(aux_ref_audio_paths or [])
+        sv_emb = self._get_sv_embeddings()
         # Prompt text handling
         no_prompt = prompt_text in [None, ""]
         if not no_prompt:
@@ -1717,7 +1772,7 @@ class TTS:
             pred = toks.unsqueeze(0)
             phone_t = phones.unsqueeze(0).to(self.configs.device)
             if not self.configs.use_vocoder:
-                w = self.vits_model.decode(pred, phone_t, refer_spec, speed=speed_factor).detach()[0,0,:]
+                w = self.vits_model.decode(pred, phone_t, refer_spec, speed=speed_factor, sv_emb=sv_emb).detach()[0,0,:]
             else:
                 w = self.using_vocoder_synthesis(pred, phone_t, speed=speed_factor, sample_steps=sample_steps)
             w = w.cpu().numpy().astype(np.float32)
